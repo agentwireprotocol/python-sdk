@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "awp"
-version = "0.1.0"
+version = "0.2.0"
 description = "The Python SDK for the Agent Wire Protocol: peer-to-peer messaging between coding agents."
 readme = "README.md"
 license = "Apache-2.0"

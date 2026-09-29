@@ -16,9 +16,6 @@ import pytest
 
 import awp
 
-pytestmark = pytest.mark.asyncio
-
-
 async def next_of(peer: awp.Peer, kind: type, timeout: float = 15.0):
     """The next event of a kind, skipping others."""
     loop = asyncio.get_running_loop()
@@ -43,7 +40,7 @@ async def test_conversation(tmp):
     async with awp.Peer(os.path.join(tmp, "a"), name="a@test", ping_interval=2) as a, \
             awp.Peer(os.path.join(tmp, "b"), name="b@test", ping_interval=2) as b:
         addr = await b.listen("unix:" + os.path.join(tmp, "b.sock"))
-        assert b.addresses == [addr]
+        assert b.address == addr and addr.startswith("awp1")
         key = await a.connect(addr, timeout=10)
         assert key == b.key
         c = await next_of(b, awp.Connected)
@@ -109,8 +106,8 @@ async def test_queued_while_away_and_restart(tmp):
     b_sock = "unix:" + os.path.join(tmp, "b.sock")
     async with awp.Peer(os.path.join(tmp, "a"), name="a@test", ping_interval=1) as a:
         b = await awp.Peer(b_dir, name="b@test").start()
-        await b.listen(b_sock)
-        key = await a.connect(b_sock, timeout=10)
+        b_addr = await b.listen(b_sock)
+        key = await a.connect(b_addr, timeout=10)
         await next_of(a, awp.Connected)
         await b.close()
         await next_of(a, awp.Disconnected)
@@ -135,7 +132,7 @@ async def test_queued_while_away_and_restart(tmp):
         b = await awp.Peer(b_dir, name="b@test").start()
         await b.listen(b_sock)
         try:
-            await a.connect(b_sock, timeout=10)
+            await a.connect(b_addr, timeout=10)
             m = await next_of(b, awp.Message, 30)
             assert m.id == sent.id and m.text == "after the restart"
         finally:
@@ -155,14 +152,19 @@ def awp_bin() -> str | None:
     b = os.environ.get("AWP_BIN") or shutil.which("awp")
     if not b:
         return None
-    out = subprocess.run([b, "conform", "--list"], capture_output=True, text=True)
-    return b if out.returncode == 0 else None
+    out = subprocess.run([b, "tunnel", "--help"], capture_output=True, text=True)
+    return b if "identity" in out.stderr + out.stdout else None
 
 
-@pytest.mark.skipif(awp_bin() is None, reason="needs an awp binary with `conform` (set AWP_BIN)")
+# Every test needs `awp tunnel`: it is the transport.
+pytestmark = [pytest.mark.asyncio,
+              pytest.mark.skipif(awp_bin() is None, reason="needs an awp binary with `awp tunnel` (set AWP_BIN)")]
+
+
+
 async def test_conformance_peer_listening(tmp):
     async with awp.Peer(os.path.join(tmp, "p"), name="py@test") as p:
-        addr = await p.listen("tcp:127.0.0.1:0")
+        addr = await p.listen("udp:127.0.0.1:0")
         proc = await asyncio.create_subprocess_exec(awp_bin(), "conform", "--json", "--timeout", "10s", addr,
                                                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         out, err = await asyncio.wait_for(proc.communicate(), 120)
@@ -172,12 +174,11 @@ async def test_conformance_peer_listening(tmp):
         assert rep["passed"] == len(rep["results"])
 
 
-@pytest.mark.skipif(awp_bin() is None, reason="needs an awp binary with `conform` (set AWP_BIN)")
 async def test_conformance_peer_dialing(tmp):
     cmd = f"{sys.executable} -m awp --state {os.path.join(tmp, 'p')} --name py@test connect {{addr}}"
-    env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"))
+    env = dict(os.environ, PYTHONPATH=os.path.join(os.path.dirname(__file__), "..", "src"), AWP_BIN=awp_bin())
     proc = await asyncio.create_subprocess_exec(awp_bin(), "conform", "--json", "--timeout", "10s",
-                                                "--listen", "tcp:127.0.0.1:0", "--run", cmd,
+                                                "--listen", "udp:127.0.0.1:0", "--run", cmd,
                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env)
     out, err = await asyncio.wait_for(proc.communicate(), 120)
     rep = json.loads(out)
@@ -216,3 +217,36 @@ async def test_revoke_and_introduce(tmp):
         # b meets c through the address it was handed.
         assert await b.connect(intro.address, timeout=10) == c.key
         await next_of(c, awp.Connected)
+
+
+async def test_rotation_and_presented_grants(tmp):
+    """c trusts a with introduce; a introduces b to c with a grant bound to
+    c, which b presents in its hello and c honors. Rotating c's pre-shared
+    key keeps peers it met, and shuts out strangers with the old address."""
+    async with awp.Peer(os.path.join(tmp, "a"), name="a@test") as a, \
+            awp.Peer(os.path.join(tmp, "b"), name="b@test") as b, \
+            awp.Peer(os.path.join(tmp, "c"), name="c@test", trust=[]) as c:
+        c_addr = await c.listen("udp:127.0.0.1:0")
+        c.trusted.add(awp.wire.parse_key(a.key))
+        b_addr = await b.listen("unix:" + os.path.join(tmp, "b.sock"))
+        await a.connect(b_addr, timeout=15)
+        await a.connect(c_addr, timeout=15)
+        await next_of(b, awp.Connected)
+        a.introduce(b.key, c.key, ["fs:read"], 3600)
+        intro = await next_of(b, awp.Introduced)
+        assert intro.address == c_addr and intro.grant["aud"] == c.key
+        assert await b.connect(intro.address, timeout=15) == c.key
+        conn = await next_of(c, awp.Connected)
+        while conn.peer != b.key:
+            conn = await next_of(c, awp.Connected)
+        assert c.caps(b.key) == {"fs:read"}          # presented in b's hello, honored by c
+
+        new_addr = await c.rotate_psk()
+        assert new_addr and new_addr != c_addr
+        async with awp.Peer(name="stranger@test") as d:
+            with pytest.raises(ConnectionError):
+                await d.connect(c_addr, timeout=6)
+            assert await d.connect(new_addr, timeout=15) == c.key
+        await b.bye(c.key)
+        await next_of(b, awp.Disconnected)
+        assert await b.connect(intro.address, timeout=15) == c.key   # met before: still admitted

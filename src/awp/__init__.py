@@ -6,7 +6,7 @@
 
     async with awp.Peer("~/.mybot", name="mybot@host") as peer:
         address = await peer.listen("tailcat")
-        key = await peer.connect("tc...")
+        key = await peer.connect("awp1...")
         peer.send(key, "Please run make test.", subject="Run the suite")
         async for event in peer.events():
             if isinstance(event, awp.Message):
@@ -19,7 +19,7 @@ from .peer import Peer, PeerInfo, Sent, Thread
 from .wire import (AwpError, CommandError, StartupError, PROTOCOL_VERSION, mint_grant,
                    verify_grant)
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Peer", "PeerInfo", "Sent", "Thread",
