@@ -22,13 +22,13 @@ from ._log import debug, log
 from .connection import Connection
 from .store import (PENDING, GrantList, Identity, PeerState, _rec_bytes, atomic_write_json,
                     load_json)
-from .transport import (TailcatListener, fmt_host, is_loopback, make_tcp_listener, open_stream,
-                        parse_addr, prepare_unix_path)
+from .transport import Tunnel, TunnelError, find_awp, remote_from_preamble
 from .wire import (ACKED_TYPES, BACKOFF_CAP, BACKOFF_INITIAL, CHUNK_SIZE, DEFAULT_BLOB_LIMIT,
                    DEFAULT_GRANT_TTL, DEFAULT_PING_INTERVAL, FSYNC, MAX_LINE, MY_CAPS,
                    PROTOCOL_VERSION, REQUEST_MIMES, CommandError, StartupError, UlidGen,
-                   b64std, b64url, blob_refs, dumps_line, format_key, grant_hash, key_fp, key_matches,
-                   mint_grant, now_ts, parse_key, safe_name, verify_grant)
+                   b64decode_any, b64std, blob_refs, dumps_line, format_key, grant_hash,
+                   is_address, key_fp, key_matches, mint_grant, now_ts, parse_key, safe_name,
+                   verify_grant, x25519_public)
 
 
 @dataclass(frozen=True)
@@ -69,8 +69,8 @@ class Peer:
     ::
 
         async with awp.Peer("~/.mybot", name="mybot@host") as peer:
-            await peer.listen("tcp:127.0.0.1:7000")
-            key = await peer.connect("tcp:10.0.0.2:7000")
+            address = await peer.listen("tailcat")     # awp1...: share it
+            key = await peer.connect("awp1...")        # an address shared with you
             peer.send(key, "Please run make test.", subject="Run the suite")
             async for event in peer.events():
                 ...
@@ -80,12 +80,17 @@ class Peer:
     blobs. ``None`` uses a temporary directory with a fresh identity, removed
     on close. ``send`` never fails because the peer is away: the message is
     on disk and goes out on the next resume.
+
+    Every connection is a WireGuard tunnel between the two peers' keys. The
+    tunnel is ``awp tunnel``, the reference implementation's, run as a
+    helper process: ``awp`` names the binary (default ``$AWP_BIN`` or
+    ``awp`` on PATH).
     """
 
     def __init__(self, state_dir: str | os.PathLike[str] | None = None, *, name: str | None = None,
                  about: str | None = None, trust: Iterable[str] = (),
                  ping_interval: float = DEFAULT_PING_INTERVAL, blob_limit: int = DEFAULT_BLOB_LIMIT,
-                 caps: Iterable[str] | None = None, tailcat: str = "tailcat") -> None:
+                 caps: Iterable[str] | None = None, awp: str | None = None) -> None:
         self._ephemeral = state_dir is None
         self.state_dir = (tempfile.mkdtemp(prefix="awp-") if state_dir is None
                           else os.path.abspath(os.path.expanduser(os.fspath(state_dir))))
@@ -103,7 +108,7 @@ class Peer:
         self.ping_interval = max(0.05, float(ping_interval)) if ping_interval > 0 else 0.0
         self.blob_limit = int(blob_limit)
         self.hello_caps = list(caps) if caps is not None else list(MY_CAPS)
-        self.tailcat_bin = tailcat
+        self.awp_bin = awp
         self.ids = UlidGen()
         self.identity = Identity.load_or_create(os.path.join(self.state_dir, "identity.json"))
         self.key = self.identity.key
@@ -135,10 +140,11 @@ class Peer:
         if isinstance(dp, dict) and dp.get("fp") in self.peers:
             self.default_fp = dp["fp"]
         self._parked: set[str] = set()
-        self._servers: list[Any] = []
-        self._tailcat: TailcatListener | None = None
+        self._tunnel: Tunnel | None = None
+        self._tunnel_lock: asyncio.Lock | None = None
         self._dialers: dict[str, asyncio.Task[None]] = {}
-        self._conn_procs: dict[Connection, Any] = {}
+        self._dial_waiters: dict[str, asyncio.Future[str]] = {}
+        self._want_dial: set[str] = set()
         self._queue: asyncio.Queue[ev.Event] | None = None
         self._pending_events: list[ev.Event] = []
         self.wake: asyncio.Event | None = None
@@ -186,8 +192,6 @@ class Peer:
             except (asyncio.CancelledError, Exception):
                 pass
         self._dialers.clear()
-        for s in self._servers:
-            s.close()
         for c in list(self.all_conns):
             c.close("closing")
         for c in list(self.all_conns):
@@ -195,20 +199,9 @@ class Peer:
                 await asyncio.wait_for(c.done.wait(), 2)
             except asyncio.TimeoutError:
                 pass
-        for s in self._servers:
-            try:
-                await asyncio.wait_for(s.wait_closed(), 2)
-            except (asyncio.TimeoutError, Exception):
-                pass
-        self._servers.clear()
-        if self._tailcat is not None:
-            await self._tailcat.close()
-            self._tailcat = None
-        for proc in list(self._conn_procs.values()):
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
+        if self._tunnel is not None:
+            await self._tunnel.close()
+            self._tunnel = None
         try:
             os.close(self._lock_fd)
         except OSError:
@@ -218,52 +211,68 @@ class Peer:
 
     # -- listening and connecting --------------------------------------------------
 
-    @property
-    def addresses(self) -> list[str]:
-        """The addresses this Peer listens on, the tailcat one first."""
-        out = [f"tailcat:{self._tailcat.address}"] if self._tailcat and self._tailcat.address else []
-        return out + [s.awp_addr for s in self._servers if getattr(s, "awp_addr", None)]
-
-    async def listen(self, addr: str = "tailcat") -> str:
-        """Accept connections on ``tcp:HOST:PORT``, ``unix:/path``, or
-        ``tailcat`` (a WireGuard tunnel through the tailcat CLI, reachable
-        from anywhere). Returns the address to share, with the port that
-        was bound."""
+    async def _ensure_tunnel(self) -> Tunnel:
+        """Start ``awp tunnel`` for this Peer, once."""
         await self.start()
-        if addr in ("tailcat", "tailcat:"):
-            sock = make_tcp_listener("127.0.0.1", 0)
-            server = await asyncio.start_server(self._accept, sock=sock, limit=2 * MAX_LINE)
-            port = sock.getsockname()[1]
-            server.awp_addr = None  # type: ignore[attr-defined]
-            self._servers.append(server)
-            self._tailcat = await TailcatListener.start(self.tailcat_bin, port)
-            shown = f"tailcat:{self._tailcat.address}"
-            log(f"listening on {shown} (tailcat serve 1:127.0.0.1:{port})")
-            return shown
-        target = parse_addr(addr)
-        if target[0] == "tcp":
-            _, host, port = target
-            if not is_loopback(host):
-                log("warning: plaintext TCP on a non-loopback address has no transport encryption "
-                    "(spec 4.2); use it on trusted networks only")
-            sock = make_tcp_listener(host, port)
-            server = await asyncio.start_server(self._accept, sock=sock, limit=2 * MAX_LINE)
-            shown = f"tcp:{fmt_host(host)}:{sock.getsockname()[1]}"
-        else:
-            path = target[1]
-            prepare_unix_path(path)
-            server = await asyncio.start_unix_server(self._accept, path=path, limit=2 * MAX_LINE)
-            shown = f"unix:{path}"
-        server.awp_addr = shown  # type: ignore[attr-defined]
-        self._servers.append(server)
-        log(f"listening on {shown}")
-        return shown
+        if self._tunnel_lock is None:
+            self._tunnel_lock = asyncio.Lock()
+        async with self._tunnel_lock:
+            if self._tunnel is None:
+                t = Tunnel(find_awp(self.awp_bin), os.path.join(self.state_dir, "identity.json"),
+                           os.path.join(self.state_dir, "tunnel"))
+                await t.start(self._accept)
+                self._tunnel = t
+                log(f"tunnel up (awp tunnel, pid {t.proc.pid if t.proc else '?'})")
+        return self._tunnel
+
+    @property
+    def address(self) -> str | None:
+        """The address to share (``awp1...``): this Peer's key, the
+        pre-shared key that admits peers it has not met, and every carrier
+        it listens on. None until it listens on something."""
+        return self._tunnel.address if self._tunnel else None
+
+    async def listen(self, carrier: str = "tailcat") -> str:
+        """Accept connections on a carrier, and return the address to share,
+        which lists every carrier this Peer listens on:
+
+        ``tailcat``
+            reachable from anywhere, through NAT, with no account
+        ``udp:HOST:PORT``
+            plain UDP: a LAN, Fly's 6PN, a public address
+        ``ws:HOST:PORT`` or ``ws:HOST:PORT=URL``
+            WebSockets, or behind a proxy or HTTP tunnel at URL
+        ``cloudflare``
+            WebSockets through a Cloudflare quick tunnel (needs cloudflared)
+        ``unix:/path``
+            peers on the same machine
+
+        tailcat and cloudflare take a few seconds to come up."""
+        t = await self._ensure_tunnel()
+        try:
+            address = await t.listen(carrier)
+        except TunnelError as e:
+            raise StartupError(f"cannot listen on {carrier}: {e}") from None
+        log(f"listening on {carrier}")
+        return address
+
+    async def rotate_psk(self) -> str | None:
+        """Replace the pre-shared key in this Peer's address. Copies of the
+        address shared before stop admitting peers not met yet; peers
+        already met keep working. Returns the new address."""
+        t = await self._ensure_tunnel()
+        return await t.rotate()
 
     async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """A stream a peer opened, forwarded by the tunnel helper."""
+        try:
+            pre = await asyncio.wait_for(reader.readline(), 10)
+        except (asyncio.TimeoutError, OSError):
+            writer.close()
+            return
+        remote = remote_from_preamble(pre)
         self.conn_counter += 1
-        peer = writer.get_extra_info("peername")
-        where = f"{peer[0]}:{peer[1]}" if isinstance(peer, tuple) and len(peer) >= 2 else "unix peer"
-        conn = Connection(self, reader, writer, f"conn#{self.conn_counter} from {where}")
+        conn = Connection(self, reader, writer, f"conn#{self.conn_counter} in", remote=remote)
         conn.outbound = False  # type: ignore[attr-defined]
         try:
             await conn.run()
@@ -275,20 +284,26 @@ class Peer:
         peer that answered, once the handshake is done. The Peer keeps
         dialing with backoff, capped at a minute, whenever there are unacked
         messages or open threads with that peer."""
-        await self.start()
-        target = parse_addr(addr)
-        if target[0] == "tcp" and not is_loopback(target[1]):
-            log("warning: plaintext TCP to a non-loopback address; use it on trusted networks only")
+        if not is_address(addr):
+            raise StartupError(f"{addr!r} is not an address; addresses start with awp1")
+        addr = addr.strip()
+        await self._ensure_tunnel()
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[str] = loop.create_future()
+        self._want_dial.add(addr)                   # dial now, work or not
         if addr in self._dialers and not self._dialers[addr].done():
             for ps in self.peers.values():
-                if ps.meta.get("dialed") == addr and ps.fp in self.connections:
-                    return ps.key_str or format_key(ps.key_raw)
+                if ps.meta.get("dialed") == addr:
+                    if ps.fp in self.connections:
+                        self._want_dial.discard(addr)
+                        return ps.key_str or format_key(ps.key_raw)
+                    self._parked.discard(ps.fp)     # an explicit connect lifts a bye
             fut = self._dial_waiters.setdefault(addr, fut)
+            assert self.wake is not None
+            self.wake.set()
         else:
             self._dial_waiters[addr] = fut
-            self._dialers[addr] = asyncio.create_task(self._dial_loop(addr, target))
+            self._dialers[addr] = asyncio.create_task(self._dial_loop(addr))
         try:
             return await asyncio.wait_for(asyncio.shield(fut), timeout)
         except asyncio.TimeoutError:
@@ -298,35 +313,43 @@ class Peer:
             self._dial_waiters.pop(addr, None)
             raise ConnectionError(f"no handshake with {addr} within {timeout}s") from None
 
-    _dial_waiters: dict[str, asyncio.Future[str]] = {}
 
-    async def _dial_loop(self, addr: str, target: tuple[Any, ...]) -> None:
+    async def _dial_loop(self, addr: str) -> None:
         delay = BACKOFF_INITIAL
         ps: PeerState | None = None
         try:
             while not self._closed:
-                if ps is not None and (ps.fp in self._parked or not (ps.has_work() or self.pending.has_work())):
+                idle = lambda: (addr not in self._want_dial and ps is not None and  # noqa: E731
+                                (ps.fp in self._parked or not (ps.has_work() or self.pending.has_work())))
+                if idle():
                     assert self.wake is not None
                     self.wake.clear()
-                    if ps.fp in self._parked or not (ps.has_work() or self.pending.has_work()):
+                    if idle():
                         log(f"{addr}: idle; waiting for new work")
                         await self.wake.wait()
                     continue
+                addrs = [addr]
+                if ps is not None and is_address(ps.meta.get("addr")) and ps.meta["addr"] != addr:
+                    addrs.append(ps.meta["addr"])       # where the peer said it is, in hello
                 try:
-                    reader, writer, proc = await asyncio.wait_for(open_stream(target, self.tailcat_bin), timeout=15)
-                except (OSError, asyncio.TimeoutError, StartupError) as e:
+                    assert self._tunnel is not None
+                    reader, writer, rep = await self._tunnel.dial(addrs, timeout=60)
+                except (OSError, asyncio.TimeoutError, ValueError, AssertionError) as e:
                     d = delay * random.uniform(0.9, 1.1)
                     log(f"connect {addr} failed: {e or type(e).__name__}; retrying in {d:.2f}s")
                     await asyncio.sleep(d)
                     delay = min(delay * 2, BACKOFF_CAP)
                     continue
                 self.conn_counter += 1
-                conn = Connection(self, reader, writer, f"conn#{self.conn_counter} to {addr}")
+                try:
+                    remote = b64decode_any(rep.get("remote"))
+                except ValueError:
+                    remote = None
+                conn = Connection(self, reader, writer, f"conn#{self.conn_counter} to {addr[:16]}…", remote=remote)
                 conn.outbound = True  # type: ignore[attr-defined]
                 conn.dialed = addr  # type: ignore[attr-defined]
-                if proc is not None:
-                    self._conn_procs[conn] = proc
                 established = await conn.run()
+                self._want_dial.discard(addr)
                 if established:
                     ps = conn.ps
                     delay = BACKOFF_INITIAL
@@ -340,9 +363,20 @@ class Peer:
 
     # -- what the connections call ---------------------------------------------------
 
-    def make_hello(self) -> dict[str, Any]:
+    def make_hello(self, remote: bytes | None = None) -> dict[str, Any]:
+        """Our hello: our address without its pre-shared key, so the peer can
+        reconnect to us, and the grants we hold that concern the peer on the
+        other end of the tunnel (ones it issued, and introductions meant for
+        it)."""
+        grants = []
+        if remote is not None:
+            for g in self.held.valid():
+                if any(isinstance(g.get(f), str) and _tunnel_key(g[f]) == remote for f in ("iss", "aud")):
+                    grants.append(g)
+        public = self._tunnel.public if self._tunnel else None
         return self.envelope("hello", v=PROTOCOL_VERSION, key=self.key, name=self.name,
-                             nonce=b64url(os.urandom(32)), caps=list(self.hello_caps), about=self.about)
+                             caps=list(self.hello_caps), about=self.about, addr=public,
+                             grants=grants or None)
 
     def make_err(self, code: str, detail: str, re: str | None = None, ref: str | None = None) -> dict[str, Any]:
         return self.envelope("err", re=re, code=code, detail=detail, ref=ref)
@@ -473,12 +507,6 @@ class Peer:
         self.all_conns.discard(conn)
         if conn.ps is not None and self.connections.get(conn.ps.fp) is conn:
             del self.connections[conn.ps.fp]
-        proc = self._conn_procs.pop(conn, None)
-        if proc is not None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
         reason = conn.close_reason or "closed"
         log(f"{conn.label}: closed ({reason})")
         if conn.established:
@@ -821,7 +849,7 @@ class Peer:
         log(f"{conn.label}: introduced to {key}")
         self._emit(ev.Introduced(peer=conn.peer_key_str or "", key=key,
                                  name=peer.get("name") if isinstance(peer.get("name"), str) else None,
-                                 address=peer.get("address") if isinstance(peer.get("address"), str) else None,
+                                 address=peer.get("address") if is_address(peer.get("address")) else None,
                                  thread=obj.get("th") if isinstance(obj.get("th"), str) else None,
                                  grant=dict(g) if isinstance(g, dict) else None))
 
@@ -952,7 +980,9 @@ class Peer:
         known = self.peers.get(key_fp(parse_key(peer)))
         if known is None or known.key_raw is None:
             raise CommandError(f"unknown peer {peer}")
-        address = known.meta.get("addr") or known.meta.get("dialed")
+        # The address we dialed carries the peer's pre-shared key; the one it
+        # sent in hello does not.
+        address = known.meta.get("dialed") or known.meta.get("addr")
         if not address:
             raise CommandError(f"no known address for {peer}")
         g = mint_grant(self.identity, to, list(caps), ttl, aud=peer)
@@ -1043,6 +1073,13 @@ class Peer:
 
     def __repr__(self) -> str:
         return f"<awp.Peer {self.name} {self.key}>"
+
+
+def _tunnel_key(key: str) -> bytes | None:
+    try:
+        return x25519_public(parse_key(key))
+    except ValueError:
+        return None
 
 
 def _derive_subject(parts: list[dict[str, Any]]) -> str | None:

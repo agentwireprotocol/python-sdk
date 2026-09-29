@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""The stdin/stdout driver (python -m awp), tested the way the original
-single-file peer was: as a subprocess, plus raw sockets against it.
+"""The stdin/stdout driver (python -m awp), tested as a subprocess, plus a
+raw client against it.
 
-Runs real peer processes against each other over TCP and Unix sockets, and uses
-raw sockets (with an independent handshake written against the spec) for the
-negative cases.
-
-    cd python && python3 -m unittest -v test_awp_peer
+Runs real peer processes against each other over the udp and unix carriers,
+and uses a raw client (its own `awp tunnel`, and lines written by hand
+against the spec) for the negative cases. Needs an awp binary (AWP_BIN, or
+awp on PATH).
 """
 
 import base64
@@ -54,12 +53,23 @@ def ts() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def free_port() -> int:
-    s = socket.socket()
+def free_udp_port() -> int:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.bind(("127.0.0.1", 0))
     port = s.getsockname()[1]
     s.close()
     return port
+
+
+def awp_bin():
+    b = os.environ.get("AWP_BIN") or shutil.which("awp")
+    if not b:
+        return None
+    out = subprocess.run([b, "tunnel", "--help"], capture_output=True, text=True)
+    return b if "identity" in out.stderr + out.stdout else None
+
+
+AWP = awp_bin()
 
 
 def is_recv(t, **match):
@@ -188,22 +198,32 @@ class PeerProc:
 
 
 class RawPeer:
-    """A minimal hand-rolled awp client used to poke at the peer's edges."""
+    """A minimal hand-rolled awp client used to poke at the peer's edges. It
+    reaches the peer through an `awp tunnel` of its own, holding its own
+    key, and writes every line itself."""
 
     def __init__(self, addr, sk=None, timeout=10.0):
-        kind, rest = addr.split(":", 1)
-        if kind == "tcp":
-            host, port = rest.rsplit(":", 1)
-            self.sock = socket.create_connection((host, int(port)), timeout=timeout)
-        else:
-            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            self.sock.settimeout(timeout)
-            self.sock.connect(rest)
-        self.buf = b""
         self.sk = sk or Ed25519PrivateKey.generate()
         self.pub = self.sk.public_key().public_bytes(serialization.Encoding.Raw,
                                                      serialization.PublicFormat.Raw)
         self.key = "ed25519:" + b64url(self.pub)
+        seed = self.sk.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+                                     serialization.NoEncryption())
+        self.dir = tempfile.mkdtemp(prefix="awpr-", dir="/tmp")
+        ctl = os.path.join(self.dir, "ctl.sock")
+        self.helper = subprocess.Popen([AWP, "tunnel", "--socket", ctl], stdin=subprocess.PIPE,
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                       env=dict(os.environ, AWP_IDENTITY_SEED=b64url(seed)))
+        ready = json.loads(self.helper.stdout.readline())
+        assert ready.get("event") == "ready", ready
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(30)
+        self.sock.connect(ctl)
+        self.sock.sendall(json.dumps({"dial": [addr]}).encode() + b"\n")
+        self.buf = b""
+        reply = json.loads(self.read_line(30))
+        assert reply.get("ok"), reply
+        self.sock.settimeout(timeout)
         self.n = 0
 
     def next_id(self) -> str:
@@ -253,36 +273,24 @@ class RawPeer:
                 return out
             out.append(obj)
 
-    def hello_obj(self, v=0):
-        return {"t": "hello", "id": self.next_id(), "ts": ts(), "v": v, "key": self.key,
-                "name": "raw-test-client", "nonce": b64url(os.urandom(32)), "caps": ["chat"],
-                "about": "unit test"}
+    def hello_obj(self, v=1, key=None, grants=None):
+        h = {"t": "hello", "id": self.next_id(), "ts": ts(), "v": v, "key": key or self.key,
+             "name": "raw-test-client", "caps": ["chat"], "about": "unit test"}
+        if grants:
+            h["grants"] = grants
+        return h
 
-    def handshake(self, seen=None, tamper=False, grants=None):
-        """Full hello/auth/resume exchange.  Returns (peer_hello, peer_auth, peer_resume)."""
+    def handshake(self, seen=None, grants=None):
+        """Hello both ways, then resume both ways. Returns (peer_hello, peer_resume)."""
         peer_hello_line = self.read_line()
         assert peer_hello_line is not None, "no hello from peer"
         peer_hello = json.loads(peer_hello_line)
-        assert peer_hello["t"] == "hello"
-        my_line = self.send(self.hello_obj())
-        peer_auth = self.read()
-        assert peer_auth and peer_auth["t"] == "auth", peer_auth
-        # Independently verify the peer's signature (section 7.2).
-        Ed25519PublicKey.from_public_bytes(raw_pub(peer_hello["key"])).verify(
-            b64url_dec(peer_auth["sig"]),
-            b"awp-auth-v0\x00" + peer_hello_line + b"\x00" + my_line)
-        sig = bytearray(self.sk.sign(b"awp-auth-v0\x00" + my_line + b"\x00" + peer_hello_line))
-        if tamper:
-            sig[5] ^= 0x01
-        auth = {"t": "auth", "id": self.next_id(), "ts": ts(), "sig": b64url(bytes(sig))}
-        if grants:
-            auth["grants"] = grants
-        self.send(auth)
-        if tamper:
-            return peer_hello, peer_auth, None
+        assert peer_hello["t"] == "hello" and peer_hello["v"] == 1, peer_hello
+        assert "nonce" not in peer_hello
+        self.send(self.hello_obj(grants=grants))
         peer_resume = self.read_until(lambda o: o.get("t") == "resume")
         self.send({"t": "resume", "id": self.next_id(), "ts": ts(), "seen": seen or {}})
-        return peer_hello, peer_auth, peer_resume
+        return peer_hello, peer_resume
 
     def ping_roundtrip(self, timeout=10.0, seen=None):
         pid = self.next_id()
@@ -295,10 +303,17 @@ class RawPeer:
             self.sock.close()
         except OSError:
             pass
+        try:
+            self.helper.stdin.close()               # the helper exits when stdin closes
+            self.helper.wait(5)
+        except (OSError, subprocess.TimeoutExpired):
+            self.helper.kill()
+        shutil.rmtree(self.dir, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- base class
 
+@unittest.skipIf(AWP is None, "needs an awp binary with `awp tunnel` (set AWP_BIN)")
 class PeerTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="hp-")
@@ -318,7 +333,7 @@ class PeerTestBase(unittest.TestCase):
     def state(self, name) -> str:
         return os.path.join(self.tmp, f"state-{name}")
 
-    def unix_addr(self, name="listen") -> str:
+    def unix_carrier(self, name="listen") -> str:
         return "unix:" + os.path.join(self.tmp, f"{name}.sock")
 
     def spawn(self, state, mode, addr, name, **kw) -> PeerProc:
@@ -336,9 +351,9 @@ class PeerTestBase(unittest.TestCase):
         self.raws.append(r)
         return r
 
-    def pair(self, addr, **kw):
-        """alice listens on addr, bob connects; both report connected."""
-        a, real = self.listener(addr, "alice", **kw)
+    def pair(self, carrier, **kw):
+        """alice listens on the carrier, bob connects; both report connected."""
+        a, real = self.listener(carrier, "alice", **kw)
         b = self.spawn(self.state("bob"), "connect", real, "bob", **kw)
         ida = a.wait_event("identity")
         idb = b.wait_event("identity")
@@ -353,9 +368,9 @@ class PeerTestBase(unittest.TestCase):
 
 class TwoPeerTests(PeerTestBase):
 
-    def _roundtrip(self, addr):
-        a, b, real = self.pair(addr)
-        self.assertTrue(a.wait_event("listening")["addr"].startswith(addr.split(":")[0]))
+    def _roundtrip(self, carrier):
+        a, b, real = self.pair(carrier)
+        self.assertTrue(a.wait_event("listening")["addr"].startswith("awp1"))
         # First connection: both resumes carry an empty seen map.
         self.assertEqual(a.wait_for(is_recv("resume"))["msg"]["seen"], {})
         self.assertEqual(b.wait_for(is_recv("resume"))["msg"]["seen"], {})
@@ -387,15 +402,15 @@ class TwoPeerTests(PeerTestBase):
         ids = [e["id"] for e in a.find(lambda e: e.get("event") == "sent")]
         self.assertEqual(ids, sorted(ids))
 
-    def test_tcp_handshake_and_message_roundtrip(self):
-        self._roundtrip("tcp:127.0.0.1:0")
+    def test_udp_handshake_and_message_roundtrip(self):
+        self._roundtrip("udp:127.0.0.1:0")
 
     def test_unix_handshake_and_message_roundtrip(self):
-        self._roundtrip(self.unix_addr())
+        self._roundtrip(self.unix_carrier())
 
     def test_queued_while_disconnected_delivered_in_order(self):
-        addr = self.unix_addr()
-        a, b, _ = self.pair(addr)
+        carrier = self.unix_carrier()
+        a, b, _ = self.pair(carrier)
         b.cmd(cmd="send", th="t1", subject="queue test", text="first")
         first = b.wait_event("sent")["id"]
         a.wait_for(is_recv("msg", id=first))
@@ -411,7 +426,7 @@ class TwoPeerTests(PeerTestBase):
         queued_ids = [e["id"] for e in sent[1:]]
         time.sleep(0.3)
         self.assertEqual(b.find(lambda e: e.get("event") == "acked", start=mark), [])
-        a2 = self.spawn(self.state("alice"), "listen", addr, "alice")       # same state + address
+        a2 = self.spawn(self.state("alice"), "listen", carrier, "alice")    # same state + address
         a2.wait_event("connected")
         # alice's resume after restart remembers what it saw before the kill
         resume = b.wait_for(is_recv("resume"), start=mark)["msg"]
@@ -424,22 +439,25 @@ class TwoPeerTests(PeerTestBase):
             b.wait_event("acked", id=q)
 
     def test_messages_queued_before_first_connection(self):
-        addr = self.unix_addr()
-        b = self.spawn(self.state("bob"), "connect", addr, "bob")       # nobody listening yet
+        carrier = self.unix_carrier()
+        a0, addr = self.listener(carrier)          # learn alice's address, then take her down
+        a0.stop()
+        b = self.spawn(self.state("bob"), "connect", addr, "bob")       # nobody listening now
         b.wait_event("identity")
         for i in range(3):
             b.cmd(cmd="send", th="early", text=f"early-{i}")
         ids = [e["id"] for e in b.wait_count(lambda e: e.get("event") == "sent", 3)]
         time.sleep(0.7)                                                  # a few failed attempts
-        a, _ = self.listener(addr)
+        a, again = self.listener(carrier)
+        self.assertEqual(again, addr)                                    # the same address after a restart
         got = a.wait_count(is_recv("msg"), 3)
         self.assertEqual([e["msg"]["id"] for e in got], ids)
         for i in ids:
             b.wait_event("acked", id=i)
 
     def test_kill9_receiver_resumes_without_loss_or_duplicates(self):
-        addr = f"tcp:127.0.0.1:{free_port()}"
-        a1, b, _ = self.pair(addr)
+        carrier = f"udp:127.0.0.1:{free_udp_port()}"
+        a1, b, _ = self.pair(carrier)
         n1, n2 = 10, 30
         # A paced conversation first.  The kill lands between messages: the peer
         # emits `recv` a few microseconds before it persists the id, so a kill
@@ -457,7 +475,7 @@ class TwoPeerTests(PeerTestBase):
         sent = b.wait_count(lambda e: e.get("event") == "sent", n1 + n2)
         sent_ids = [e["id"] for e in sent]
         b.wait_event("disconnected")
-        a2 = self.spawn(self.state("alice"), "listen", addr, "alice")
+        a2 = self.spawn(self.state("alice"), "listen", carrier, "alice")
         a2.wait_event("connected")
         a2.wait_for(lambda e: is_recv("msg")(e) and text_of(e["msg"]) == f"m{n1 + n2 - 1}",
                     what="last message")
@@ -474,8 +492,7 @@ class TwoPeerTests(PeerTestBase):
             self.assertEqual([m["id"] for m in received if m["th"] == th], expect)
 
     def test_kill9_sender_replays_from_durable_outbox(self):
-        addr = self.unix_addr()
-        a, b1, _ = self.pair(addr)
+        a, b1, addr = self.pair(self.unix_carrier())
         n = 30
         for i in range(n):
             b1.cmd(cmd="send", th="t1", text=f"s{i}")
@@ -496,7 +513,7 @@ class TwoPeerTests(PeerTestBase):
         self.assertTrue(acked >= set(ids), f"unacked: {set(ids) - acked}")
 
     def test_multichunk_blob_arrives_byte_identical(self):
-        a, b, _ = self.pair("tcp:127.0.0.1:0")
+        a, b, _ = self.pair("udp:127.0.0.1:0")
         data = os.urandom(700 * 1024 + 123)
         path = os.path.join(self.tmp, "integration.log")
         with open(path, "wb") as f:
@@ -526,8 +543,8 @@ class TwoPeerTests(PeerTestBase):
         self.assertEqual(os.listdir(outgoing), [])
 
     def test_kill9_receiver_mid_blob_completes_after_restart(self):
-        addr = f"tcp:127.0.0.1:{free_port()}"
-        a1, b, _ = self.pair(addr)
+        carrier = f"udp:127.0.0.1:{free_udp_port()}"
+        a1, b, _ = self.pair(carrier)
         data = os.urandom(11 * 256 * 1024 + 999)                        # 12 chunks
         path = os.path.join(self.tmp, "big.tar")
         with open(path, "wb") as f:
@@ -538,7 +555,7 @@ class TwoPeerTests(PeerTestBase):
         a1.kill9()
         self.assertEqual(a1.find(lambda e: e.get("event") == "blob"), [])
         b.wait_event("disconnected")
-        a2 = self.spawn(self.state("alice"), "listen", addr, "alice")
+        a2 = self.spawn(self.state("alice"), "listen", carrier, "alice")
         ev = a2.wait_event("blob", timeout=30)
         with open(ev["path"], "rb") as f:
             self.assertEqual(hashlib.sha256(f.read()).hexdigest(), hashlib.sha256(data).hexdigest())
@@ -550,7 +567,7 @@ class TwoPeerTests(PeerTestBase):
         self.assertEqual(ns, list(range(ns[0], 12)))
 
     def test_blob_over_limit_is_refused(self):
-        a, _ = self.listener("tcp:127.0.0.1:0", extra=["--max-blob", "100000"])
+        a, _ = self.listener("udp:127.0.0.1:0", extra=["--max-blob", "100000"])
         addr = a.wait_event("listening")["addr"]
         b = self.spawn(self.state("bob"), "connect", addr, "bob")
         b.wait_event("connected")
@@ -568,7 +585,7 @@ class TwoPeerTests(PeerTestBase):
         self.assertEqual(os.listdir(os.path.join(self.state("bob"), "outgoing")), [])
 
     def test_grant_gates_exec_requests(self):
-        a, b, _ = self.pair(self.unix_addr())
+        a, b, addr = self.pair(self.unix_carrier())
         exec_part = {"k": "data", "mime": EXEC_MIME, "data": {"argv": ["make", "test"]}}
         b.cmd(cmd="send", th="x1", text="please run", parts=[exec_part])
         m1 = b.wait_event("sent")["id"]
@@ -586,7 +603,7 @@ class TwoPeerTests(PeerTestBase):
         Ed25519PublicKey.from_public_bytes(raw_pub(akey)).verify(b64url_dec(g["sig"]), canon)
         exp = datetime.strptime(g["exp"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
         self.assertTrue(500 < (exp - datetime.now(timezone.utc)).total_seconds() <= 601)
-        # bob keeps the grant (it will present it in future auth messages)
+        # bob keeps the grant (it will present it in future hellos)
         with open(os.path.join(self.state("bob"), "grants_held.json")) as f:
             self.assertEqual(json.load(f)[0]["sig"], g["sig"])
         # the same request is now allowed: acked with no forbidden err before the ack
@@ -595,17 +612,17 @@ class TwoPeerTests(PeerTestBase):
         m2 = b.wait_event("sent", start=mark, t="msg")["id"]
         b.wait_event("acked", id=m2)
         self.assertEqual(b.find(is_recv("err", re=m2)), [])
-        # after a restart bob presents the held grant in its auth message
+        # after a restart bob presents the held grant in its hello
         b.kill9()
         a.wait_event("disconnected")
         mark = a.mark()
-        b2 = self.spawn(self.state("bob"), "connect", self.unix_addr(), "bob")
+        b2 = self.spawn(self.state("bob"), "connect", addr, "bob")
         b2.wait_event("connected")
-        auth = a.wait_for(is_recv("auth"), start=mark)["msg"]
-        self.assertEqual([x["sig"] for x in auth.get("grants", [])], [g["sig"]])
+        hello = a.wait_for(is_recv("hello"), start=mark)["msg"]
+        self.assertEqual([x["sig"] for x in hello.get("grants", [])], [g["sig"]])
 
     def test_bye_closes_both_sides_and_suppresses_reconnect(self):
-        a, b, _ = self.pair(self.unix_addr())
+        a, b, _ = self.pair(self.unix_carrier())
         b.cmd(cmd="send", th="t1", text="one thing")     # t1 is now an open thread
         mid = b.wait_event("sent")["id"]
         b.wait_event("acked", id=mid)
@@ -627,28 +644,30 @@ class TwoPeerTests(PeerTestBase):
 
 class RawSocketTests(PeerTestBase):
 
-    def test_tampered_auth_signature_rejected(self):
-        a, addr = self.listener(self.unix_addr())
-        r = self.raw(addr)
-        r.handshake(tamper=True)
-        rest = r.read_to_eof()
-        errs = [o for o in rest if o.get("t") == "err"]
-        self.assertEqual([e["code"] for e in errs], ["auth"])
-        self.assertEqual([o for o in rest if o.get("t") == "resume"], [])
-        a.wait_event("error")
-        self.assertEqual(a.find(lambda e: e.get("event") == "connected"), [])
-
-    def test_version_1_rejected(self):
-        a, addr = self.listener("tcp:127.0.0.1:0")
+    def test_hello_naming_another_key_is_refused(self):
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         self.assertEqual(json.loads(r.read_line())["t"], "hello")
-        r.send(r.hello_obj(v=1))
+        other = Ed25519PrivateKey.generate().public_key().public_bytes(serialization.Encoding.Raw,
+                                                                      serialization.PublicFormat.Raw)
+        r.send(r.hello_obj(key="ed25519:" + b64url(other)))
         rest = r.read_to_eof()
-        self.assertEqual([o["t"] for o in rest], ["err"])        # no auth after a bad version
+        self.assertEqual([(o["t"], o.get("code")) for o in rest], [("err", "auth")])
+        time.sleep(0.3)
+        self.assertEqual(a.find(lambda e: e.get("event") == "connected"), [])
+        self.assertEqual(a.find(is_recv("hello")), [])          # the lie never reached the peer
+
+    def test_version_2_rejected(self):
+        a, addr = self.listener("udp:127.0.0.1:0")
+        r = self.raw(addr)
+        self.assertEqual(json.loads(r.read_line())["t"], "hello")
+        r.send(r.hello_obj(v=2))
+        rest = r.read_to_eof()
+        self.assertEqual([o["t"] for o in rest], ["err"])        # no resume after a bad version
         self.assertEqual(rest[0]["code"], "version")
 
     def test_garbage_line_gets_bad_frame(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         for garbage in (b"this is not json\n", b"[1,2,3]\n"):
             r = self.raw(addr)
             r.read_line()
@@ -663,7 +682,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual([(o["t"], o.get("code")) for o in rest if o["t"] == "err"], [("err", "bad_frame")])
 
     def test_line_over_1mib_gets_too_large(self):
-        a, addr = self.listener("tcp:127.0.0.1:0")
+        a, addr = self.listener("udp:127.0.0.1:0")
         r = self.raw(addr)
         r.read_line()
         r.send_raw(b"x" * ((1 << 20) + 100))
@@ -671,7 +690,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual([(o["t"], o["code"]) for o in rest], [("err", "too_large")])
 
     def test_unknown_type_and_unknown_fields_ignored(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         r.handshake()
         a.wait_event("connected")
@@ -697,7 +716,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual(a.find(lambda e: e.get("event") in ("error", "disconnected")), [])
 
     def test_duplicate_id_is_delivered_once_and_reacked(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         r.handshake()
         mid = r.next_id()
@@ -712,7 +731,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual(len(a.find(is_recv("msg", id=mid))), 1)
 
     def test_resume_replays_unacked_in_original_order_with_original_ids(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         for i in range(3):                               # queued before anyone connects
             a.cmd(cmd="send", th="t1", text=f"r{i}", subject="replay" if i == 0 else None)
         ids = [e["id"] for e in a.wait_count(lambda e: e.get("event") == "sent", 3)]
@@ -729,7 +748,7 @@ class RawSocketTests(PeerTestBase):
         a.wait_event("disconnected")
         # same key again, claiming to have durably seen up to ids[1]
         r2 = self.raw(addr, sk=r.sk)
-        _, _, resume = r2.handshake(seen={"t1": ids[1]})
+        _, resume = r2.handshake(seen={"t1": ids[1]})
         self.assertEqual(resume["seen"], {"t7": mine})   # alice's own seen map
         a.wait_event("acked", id=ids[1])                 # covered by our seen: implicit ack
         seen = []
@@ -741,7 +760,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual([o["id"] for o in seen if o.get("t") == "msg"], [ids[2]])
 
     def test_silent_peer_is_dropped_after_two_missed_pongs(self):
-        a, addr = self.listener(self.unix_addr(), ping=0.3)
+        a, addr = self.listener(self.unix_carrier(), ping=0.3)
         r = self.raw(addr)
         r.handshake()
         t0 = time.time()
@@ -754,17 +773,14 @@ class RawSocketTests(PeerTestBase):
         self.assertIn("missed pongs", ev["reason"])
 
     def test_go_style_encodings_and_omitted_fields_accepted(self):
-        """Padded std-alphabet key/sig, seen:null (Go nil map), msg-before-chunks,
+        """Padded std-alphabet key, seen:null (Go nil map), msg-before-chunks,
         chunks without th and with omitempty-dropped n/last, unpadded/url data."""
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
-        peer_hello_line = r.read_line()
+        r.read_line()                                                       # their hello
         hello = r.hello_obj()
         hello["key"] = "ed25519:" + base64.b64encode(r.pub).decode()       # padded, std
-        my_line = r.send(hello)
-        r.read_until(lambda o: o.get("t") == "auth")
-        sig = r.sk.sign(b"awp-auth-v0\x00" + my_line + b"\x00" + peer_hello_line)
-        r.send({"t": "auth", "id": r.next_id(), "ts": ts(), "sig": base64.b64encode(sig).decode()})
+        r.send(hello)
         r.read_until(lambda o: o.get("t") == "resume")
         r.send({"t": "resume", "id": r.next_id(), "ts": ts(), "seen": None})
         self.assertEqual(a.wait_event("connected")["key"], hello["key"])   # echoed as sent
@@ -785,7 +801,7 @@ class RawSocketTests(PeerTestBase):
         self.assertEqual(ev["ref"], "L1")
 
     def test_bye_is_answered_with_bye(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         r.handshake()
         r.send({"t": "bye", "id": r.next_id(), "ts": ts(), "reason": "done"})
@@ -794,7 +810,7 @@ class RawSocketTests(PeerTestBase):
         a.wait_event("disconnected", reason="bye")
 
     def test_err_close_semantics(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         r.handshake()
         for code in ("unsupported", "forbidden", "internal", "blob_refused", "some_future_code"):
@@ -805,7 +821,7 @@ class RawSocketTests(PeerTestBase):
         a.wait_event("disconnected")
 
     def test_one_level_grant_delegation_via_introduce(self):
-        a, addr = self.listener(self.unix_addr())
+        a, addr = self.listener(self.unix_carrier())
         akey = a.wait_event("identity")["key"]
 
         def mint(sk, sub, caps):
@@ -836,7 +852,7 @@ class RawSocketTests(PeerTestBase):
         # X introduces itself with a grant for alice (stored as held by alice)
         g_xa = mint(x.sk, akey, ["chat-extra"])
         x.send({"t": "introduce", "id": x.next_id(), "ts": ts(), "th": "i1",
-                "peer": {"key": x.key, "name": "x", "address": "unix:/nowhere"}, "grant": g_xa})
+                "peer": {"key": x.key, "name": "x"}, "grant": g_xa})
         x.ping_roundtrip()
         with open(os.path.join(self.state("alice"), "grants_held.json")) as f:
             self.assertIn(g_xa["sig"], [g["sig"] for g in json.load(f)])
@@ -854,15 +870,14 @@ class RawSocketTests(PeerTestBase):
         z.handshake(grants=[mint(wsk, z.key, ["exec"])])
         self.assertTrue(exec_forbidden(z))
 
-    def test_messages_before_auth_are_rejected(self):
-        a, addr = self.listener(self.unix_addr())
+    def test_messages_before_hello_are_rejected(self):
+        a, addr = self.listener(self.unix_carrier())
         r = self.raw(addr)
         r.read_line()
-        r.send(r.hello_obj())
         r.send({"t": "msg", "id": r.next_id(), "ts": ts(), "th": "t1",
                 "parts": [{"k": "text", "text": "sneaky"}]})
         rest = r.read_to_eof()
-        self.assertEqual([o.get("code") for o in rest if o["t"] == "err"], ["auth"])
+        self.assertEqual([o.get("code") for o in rest if o["t"] == "err"], ["bad_frame"])
         self.assertEqual(a.find(is_recv("msg")), [])
 
 
@@ -886,27 +901,34 @@ class UnitTests(unittest.TestCase):
             self.assertFalse(hp.pure_ed25519_verify(pub, bytes(bad), msg))
             self.assertFalse(hp.pure_ed25519_verify(pub, sig, msg + b"x"))
 
+    @unittest.skipIf(AWP is None, "needs an awp binary with `awp tunnel` (set AWP_BIN)")
     def test_pure_python_peer_interoperates(self):
-        """A peer forced onto the fallback crypto still handshakes with a raw client."""
-        tmp = tempfile.mkdtemp(prefix="hp-")
+        """A peer forced onto the fallback crypto mints grants that verify with
+        the cryptography package, over a real connection."""
+        tmp = tempfile.mkdtemp(prefix="hp-", dir="/tmp")
         try:
             env = dict(os.environ, AWP_PURE_ED25519="1")
-            sock = os.path.join(tmp, "p.sock")
-            if len(sock) > 100:
-                shutil.rmtree(tmp)
-                tmp = tempfile.mkdtemp(prefix="hp-", dir="/tmp")
-                sock = os.path.join(tmp, "p.sock")
             p = subprocess.Popen([*PEER_CMD, "--state", os.path.join(tmp, "s"),
-                                  "listen", "unix:" + sock],
+                                  "listen", "unix:" + os.path.join(tmp, "p.sock")],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.DEVNULL, env=env)
             try:
+                addr = key = None
                 for line in p.stdout:
-                    if json.loads(line).get("event") == "listening":
+                    ev = json.loads(line)
+                    if ev.get("event") == "identity":
+                        key = ev["key"]
+                    if ev.get("event") == "listening":
+                        addr = ev["addr"]
                         break
-                r = RawPeer("unix:" + sock)
-                r.handshake()                           # verifies the peer's signature too
-                r.ping_roundtrip()
+                r = RawPeer(addr)
+                r.handshake()
+                p.stdin.write((json.dumps({"cmd": "grant", "sub": r.key, "caps": ["exec"], "ttl": 60}) + "\n").encode())
+                p.stdin.flush()
+                g = r.read_until(lambda o: o.get("t") == "grant")["grant"]
+                body = {k: v for k, v in g.items() if k != "sig"}
+                canon = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+                Ed25519PublicKey.from_public_bytes(raw_pub(key)).verify(b64url_dec(g["sig"]), canon)
                 r.close()
             finally:
                 p.kill()

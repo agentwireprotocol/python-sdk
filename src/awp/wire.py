@@ -21,8 +21,7 @@ from ._ed25519 import ED25519_BACKEND, ed25519_public, ed25519_sign, ed25519_ver
 if TYPE_CHECKING:
     from .store import Identity
 
-PROTOCOL_VERSION = 0
-AUTH_CONTEXT = b"awp-auth-v0"
+PROTOCOL_VERSION = 1
 MAX_LINE = 1 << 20                      # bytes, excluding the "\n"
 CHUNK_SIZE = 256 * 1024                 # payload bytes per chunk, before base64
 DEFAULT_BLOB_LIMIT = 50 * 1024 * 1024
@@ -41,12 +40,12 @@ REQUEST_MIMES = {
     "application/vnd.awp.fs-write+json": "fs:write",
     "application/vnd.awp.admin+json": "admin",
 }
-CLOSING_ERR_CODES = frozenset({"bad_frame", "version", "auth", "too_large"})
+CLOSING_ERR_CODES = frozenset({"bad_frame", "too_large", "version", "auth", "refused"})
 ACKED_TYPES = frozenset({"msg", "state"})
 SEEN_TYPES = frozenset({"msg", "state", "chunk"})
-PRE_AUTH_FORBIDDEN = frozenset({"msg", "state", "ack", "chunk", "resume", "grant", "introduce"})
+PRE_HELLO_FORBIDDEN = frozenset({"msg", "state", "ack", "chunk", "resume", "grant", "introduce"})
 READ_SIZE = 256 * 1024
-TAILCAT_PORT = 1
+ADDRESS_PREFIX = "awp1"
 
 FSYNC = os.environ.get("AWP_FSYNC", "1") != "0"
 
@@ -338,3 +337,18 @@ def grant_hash(g: dict) -> str:
 
 # ---------------------------------------------------------------- persistence
 
+
+
+def x25519_public(ed_pub: bytes) -> bytes:
+    """The WireGuard (X25519) key of an Ed25519 public key: the Montgomery
+    u coordinate (1 + y) / (1 - y) of the same point (SPEC.md section 4.2).
+    The tunnel knows peers by this key."""
+    if len(ed_pub) != 32:
+        raise ValueError("Ed25519 public key must be 32 bytes")
+    y = int.from_bytes(ed_pub, "little") & ((1 << 255) - 1)
+    u = (1 + y) * pow((1 - y) % _P, _P - 2, _P) % _P
+    return u.to_bytes(32, "little")
+
+
+def is_address(s) -> bool:
+    return isinstance(s, str) and s.strip().startswith(ADDRESS_PREFIX)

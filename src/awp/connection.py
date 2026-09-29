@@ -1,5 +1,7 @@
-"""One connection to a peer: the handshake, the reader, the FIFO writer and
-the timers (SPEC.md sections 7 and 9)."""
+"""One connection to a peer: the hello exchange, the reader, the FIFO
+writer and the timers (SPEC.md sections 10 and 12). The stream comes from
+the tunnel helper, which has already checked that the peer's hello names
+the key on the other end of the tunnel."""
 
 from __future__ import annotations
 
@@ -9,15 +11,14 @@ import json
 import traceback
 
 from ._log import log, debug
-from .wire import (ACKED_TYPES, AUTH_CONTEXT, BYE_TIMEOUT, CLOSING_ERR_CODES, HANDSHAKE_TIMEOUT,
-                   MAX_LINE, PRE_AUTH_FORBIDDEN, PROTOCOL_VERSION, READ_SIZE, RESUME_TIMEOUT,
-                   b64decode_any, b64url, dumps_line, parse_key)
-from .wire import ed25519_verify
+from .wire import (ACKED_TYPES, BYE_TIMEOUT, CLOSING_ERR_CODES, HANDSHAKE_TIMEOUT,
+                   MAX_LINE, PRE_HELLO_FORBIDDEN, PROTOCOL_VERSION, READ_SIZE, RESUME_TIMEOUT,
+                   dumps_line, parse_key, x25519_public)
 
 class Connection:
     """One transport connection: handshake, reader, FIFO writer, timers."""
 
-    def __init__(self, node: "Node", reader, writer, label: str):
+    def __init__(self, node: "Node", reader, writer, label: str, remote: bytes | None = None):
         self.node = node
         self.reader = reader
         self.writer = writer
@@ -29,7 +30,10 @@ class Connection:
         self.closing = False
         self.close_reason = None
         self.linger = False
-        self.hello = node.make_hello()
+        # remote is the peer's tunnel (X25519) key, from the helper: it
+        # picks the grants worth presenting before the peer's hello arrives.
+        self.remote = remote
+        self.hello = node.make_hello(remote)
         self.my_hello_line = dumps_line(self.hello)
         self.peer_hello_line = None
         self.peer_hello = None
@@ -358,29 +362,14 @@ class Connection:
             if raw == node.identity.pub or line == self.my_hello_line:
                 self.fail("auth", "hello carries our own key (reflected handshake)", re=oid)
                 return
+            if self.remote is not None and x25519_public(raw) != self.remote:
+                self.fail("auth", "hello key is not the key on the other end of the tunnel", re=oid)
+                return
             self.peer_hello_line = line
             self.peer_hello = obj
             self.peer_key_raw = raw
             self.peer_key_str = obj.get("key")
             log(f"{self.label}: hello from {self.peer_key_str} name={obj.get('name')!r}")
-            sig = node.identity.sign(AUTH_CONTEXT + b"\x00" + self.my_hello_line + b"\x00" + line)
-            held = node.held.valid()
-            auth = node.envelope("auth", sig=b64url(sig), grants=held if held else None)
-            self._write(dumps_line(auth))
-            return
-        if t == "auth":
-            if self.peer_hello is None:
-                self.fail("auth", "auth received before hello", re=oid)
-                return
-            node.emit_recv(self, obj)
-            try:
-                sig = b64decode_any(obj.get("sig"))
-            except ValueError:
-                sig = b""
-            transcript = AUTH_CONTEXT + b"\x00" + self.peer_hello_line + b"\x00" + self.my_hello_line
-            if not ed25519_verify(self.peer_key_raw, sig, transcript):
-                self.fail("auth", "auth signature does not verify", re=oid)
-                return
             self._on_established(obj)
             return
         if t == "err":
@@ -396,22 +385,22 @@ class Connection:
             node.emit_recv(self, obj)
             self.close("bye before handshake completed")
             return
-        if t in PRE_AUTH_FORBIDDEN:
-            self.fail("auth", f"{t!r} received before the handshake completed", re=oid)
+        if t in PRE_HELLO_FORBIDDEN:
+            self.fail("bad_frame", f"{t!r} received before hello", re=oid)
             return
         node.emit_recv(self, obj)
         log(f"{self.label}: ignoring unknown message type {t!r} during handshake")
 
-    def _on_established(self, auth: dict) -> None:
+    def _on_established(self, hello: dict) -> None:
         node = self.node
         self.established = True
         self.established_at = self.loop.time()
         self.ps = node.bind_peer(self.peer_key_raw, self.peer_key_str, self.peer_hello)
         node.register_connection(self)
-        grants = auth.get("grants")
+        grants = hello.get("grants")
         if isinstance(grants, list):
             for g in grants:
-                node.receive_grant(self, g, "auth")
+                node.receive_grant(self, g, "hello")
         h = self.peer_hello
         name = h.get("name") if isinstance(h.get("name"), str) else ""
         caps = h.get("caps") if isinstance(h.get("caps"), list) else []
@@ -462,8 +451,8 @@ class Connection:
             self._on_bye(obj)
         elif t == "err":
             self._on_err(obj)
-        elif t in ("hello", "auth"):
-            log(f"{self.label}: ignoring {t} after the handshake")
+        elif t == "hello":
+            log(f"{self.label}: ignoring hello after the handshake")
         else:
             debug(f"{self.label}: ignoring unknown message type {t!r}")
 

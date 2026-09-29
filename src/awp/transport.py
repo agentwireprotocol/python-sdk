@@ -1,176 +1,175 @@
-"""Addresses and byte streams: tcp:HOST:PORT, unix:/path, and tailcat
-addresses through the tailcat CLI."""
+"""The tunnel: `awp tunnel`, the reference implementation's WireGuard
+tunnel as a helper process (SPEC.md section 18.2).
+
+Python has no WireGuard of its own, so a Peer runs one helper for its
+whole life. The helper holds the Peer's key, listens on the carriers it is
+asked to (tailcat, udp, ws, cloudflare, unix), opens streams to other peers
+on request, and forwards the streams they open to a Unix socket of the
+Peer's. Everything on those streams is the protocol from section 8 on,
+which the Peer speaks itself."""
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
-import socket
-import stat
+import tempfile
+from typing import Any, Awaitable, Callable
 
 from ._log import log
-from .wire import MAX_LINE, TAILCAT_PORT, StartupError
+from .wire import MAX_LINE, StartupError, b64decode_any
 
-def looks_tailcat(s: str) -> bool:
-    return len(s) >= 40 and s.startswith("tc") and all(c.isalnum() or c in "-_" for c in s)
-
-
-def parse_addr(s: str):
-    """tcp:HOST:PORT, unix:/path, tailcat:tc..., or a bare tailcat address."""
-    s = s.strip()
-    if s.startswith("tailcat:"):
-        t = s[len("tailcat:"):].lstrip("/")
-        if not looks_tailcat(t):
-            raise StartupError(f"bad tailcat address {s!r}")
-        return ("tailcat", t)
-    if looks_tailcat(s):
-        return ("tailcat", s)
-    if s.startswith("tcp:"):
-        host, sep, port = s[4:].lstrip("/").rpartition(":")
-        if not sep or not port.isdigit():
-            raise StartupError(f"bad tcp address {s!r}; expected tcp:HOST:PORT")
-        return ("tcp", host.strip("[]"), int(port))
-    if s.startswith("unix:"):
-        path = s[5:]
-        if path.startswith("//"):
-            path = path[2:]
-        if not path:
-            raise StartupError(f"bad unix address {s!r}; expected unix:/path")
-        return ("unix", path)
-    if "/" in s:
-        return ("unix", s)
-    host, sep, port = s.rpartition(":")
-    if sep and port.isdigit():
-        return ("tcp", host.strip("[]"), int(port))
-    raise StartupError(f"unrecognised address {s!r}; use tc..., tailcat:tc..., tcp:HOST:PORT or unix:/path")
+INSTALL_HINT = "install it with: curl -fsSL https://agentwireprotocol.com/install.sh | sh"
 
 
-def fmt_host(host: str) -> str:
-    return f"[{host}]" if ":" in host else host
+def find_awp(awp: str | None) -> str:
+    """The awp binary: the one given, $AWP_BIN, or awp on PATH."""
+    cand = awp or os.environ.get("AWP_BIN") or "awp"
+    path = cand if os.path.sep in cand and os.access(cand, os.X_OK) else shutil.which(cand)
+    if not path:
+        raise StartupError(f"{cand} not found: the tunnel runs as `awp tunnel`; {INSTALL_HINT}")
+    return path
 
 
-def is_loopback(host: str) -> bool:
-    return host in ("localhost", "::1") or host.startswith("127.")
+class TunnelError(ConnectionError):
+    """The helper could not do what was asked: dial, listen or rotate."""
 
 
-async def open_stream(target, tailcat_bin: str = "tailcat"):
-    """Open a byte stream to a parsed address: (reader, writer, process).
-    The process is the tailcat client for tailcat addresses, else None."""
-    if target[0] == "tcp":
-        r, w = await asyncio.open_connection(target[1], target[2], limit=2 * MAX_LINE)
-        return r, w, None
-    if target[0] == "unix":
-        r, w = await asyncio.open_unix_connection(target[1], limit=2 * MAX_LINE)
-        return r, w, None
-    binary = shutil.which(tailcat_bin)
-    if binary is None:
-        raise StartupError(f"{tailcat_bin} is not installed; tailcat addresses need the tailcat CLI "
-                           "(https://github.com/tailscale/tailcat)")
-    proc = await asyncio.create_subprocess_exec(
-        binary, target[1], str(TAILCAT_PORT),
-        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-        limit=2 * MAX_LINE)
-    assert proc.stdout is not None and proc.stdin is not None
-    return proc.stdout, proc.stdin, proc
+class Tunnel:
+    """One `awp tunnel` process."""
 
+    def __init__(self, awp: str, identity_file: str, state_dir: str) -> None:
+        self.awp = awp
+        self.identity_file = identity_file
+        self.state_dir = state_dir
+        self.address: str | None = None      # with the pre-shared key: the one to share
+        self.public: str | None = None       # without: for hello.addr
+        self.proc: asyncio.subprocess.Process | None = None
+        self._dir: str | None = None
+        self._server: asyncio.base_events.Server | None = None
+        self._events: asyncio.Task[None] | None = None
+        self._stderr: asyncio.Task[None] | None = None
+        self.on_address: Callable[[], None] | None = None
 
-class TailcatListener:
-    """`tailcat serve 1:127.0.0.1:PORT`: the tunnel's port 1, which awp peers
-    dial, proxied to a local TCP listener."""
-
-    def __init__(self, proc, address: str) -> None:
-        self.proc = proc
-        self.address = address
-
-    @classmethod
-    async def start(cls, tailcat_bin: str, port: int, timeout: float = 60.0) -> "TailcatListener":
-        binary = shutil.which(tailcat_bin)
-        if binary is None:
-            raise StartupError(f"{tailcat_bin} is not installed; listening on tailcat needs the tailcat CLI "
-                               "(https://github.com/tailscale/tailcat)")
-        proc = await asyncio.create_subprocess_exec(
-            binary, "serve", f"{TAILCAT_PORT}:127.0.0.1:{port}",
-            stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        assert proc.stderr is not None
-
-        async def find_address() -> str:
-            while True:
-                line = await proc.stderr.readline()
-                if not line:
-                    raise StartupError("tailcat exited before printing an address")
-                text = line.decode("utf-8", "replace").strip()
-                log(f"tailcat: {text}")
-                for word in text.split():
-                    if looks_tailcat(word):
-                        return word
-
+    async def start(self, accept: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]) -> None:
+        # Socket paths are limited to about 100 bytes: keep them short.
+        self._dir = tempfile.mkdtemp(prefix="awp-", dir="/tmp" if os.path.isdir("/tmp") else None)
+        ctl = os.path.join(self._dir, "ctl.sock")
+        fwd = os.path.join(self._dir, "in.sock")
+        self.ctl = ctl
+        self._server = await asyncio.start_unix_server(accept, path=fwd, limit=2 * MAX_LINE)
+        os.makedirs(self.state_dir, exist_ok=True)
+        self.proc = await asyncio.create_subprocess_exec(
+            self.awp, "tunnel", "--identity", self.identity_file, "--state", self.state_dir,
+            "--socket", ctl, "--forward", fwd,
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        assert self.proc.stdout is not None
         try:
-            address = await asyncio.wait_for(find_address(), timeout)
-        except (asyncio.TimeoutError, StartupError):
-            proc.kill()
-            raise
-        listener = cls(proc, address)
-        asyncio.get_running_loop().create_task(listener._drain())
-        return listener
+            line = await asyncio.wait_for(self.proc.stdout.readline(), 30)
+        except asyncio.TimeoutError:
+            await self.close()
+            raise StartupError("awp tunnel did not start within 30s") from None
+        if not line:
+            err = b""
+            if self.proc.stderr is not None:
+                err = await self.proc.stderr.read()
+            await self.close()
+            raise StartupError(f"awp tunnel exited: {err.decode('utf-8', 'replace').strip() or 'no output'}")
+        self._apply(json.loads(line))
+        self._events = asyncio.get_running_loop().create_task(self._read_events())
+        self._stderr = asyncio.get_running_loop().create_task(self._drain_stderr())
 
-    async def _drain(self) -> None:
-        assert self.proc.stderr is not None
+    def _apply(self, ev: dict[str, Any]) -> None:
+        if ev.get("address"):
+            self.address, self.public = ev["address"], ev.get("public")
+            if self.on_address is not None:
+                self.on_address()
+
+    async def _read_events(self) -> None:
+        assert self.proc is not None and self.proc.stdout is not None
+        while True:
+            line = await self.proc.stdout.readline()
+            if not line:
+                return
+            try:
+                self._apply(json.loads(line))
+            except ValueError:
+                pass
+
+    async def _drain_stderr(self) -> None:
+        assert self.proc is not None and self.proc.stderr is not None
         while True:
             line = await self.proc.stderr.readline()
             if not line:
                 return
-            log(f"tailcat: {line.decode('utf-8', 'replace').rstrip()}")
+            log(f"awp tunnel: {line.decode('utf-8', 'replace').rstrip()}")
+
+    async def _request(self, req: dict[str, Any], timeout: float | None):
+        r, w = await asyncio.open_unix_connection(self.ctl, limit=2 * MAX_LINE)
+        try:
+            w.write(json.dumps(req).encode() + b"\n")
+            await w.drain()
+            line = await asyncio.wait_for(r.readline(), timeout)
+        except BaseException:
+            w.close()
+            raise
+        if not line:
+            w.close()
+            raise TunnelError("awp tunnel closed the request")
+        rep = json.loads(line)
+        if not rep.get("ok"):
+            w.close()
+            raise TunnelError(rep.get("error") or "awp tunnel refused the request")
+        return rep, r, w
+
+    async def dial(self, addresses: list[str], key: str | None = None, timeout: float | None = 60.0):
+        """A stream to the peer the addresses (all of one key) describe:
+        (reader, writer, reply), reply carrying "key" and "remote"."""
+        req: dict[str, Any] = {"dial": addresses}
+        if key:
+            req["key"] = key
+        rep, r, w = await self._request(req, timeout)
+        return r, w, rep
+
+    async def listen(self, carrier: str) -> str:
+        rep, _, w = await self._request({"listen": carrier}, 120)
+        w.close()
+        self._apply(rep)
+        return rep["address"]
+
+    async def rotate(self) -> str | None:
+        rep, _, w = await self._request({"rotate": True}, 30)
+        w.close()
+        self._apply(rep)
+        return rep.get("address")
 
     async def close(self) -> None:
-        try:
-            self.proc.kill()
-        except ProcessLookupError:
-            return
-        try:
-            await asyncio.wait_for(self.proc.wait(), 5)
-        except asyncio.TimeoutError:
-            pass
+        if self.proc is not None and self.proc.returncode is None:
+            try:
+                assert self.proc.stdin is not None
+                self.proc.stdin.close()             # the helper exits when stdin closes
+                await asyncio.wait_for(self.proc.wait(), 5)
+            except (asyncio.TimeoutError, OSError, AssertionError):
+                try:
+                    self.proc.kill()
+                except ProcessLookupError:
+                    pass
+        for t in (self._events, self._stderr):
+            if t is not None:
+                t.cancel()
+        if self._server is not None:
+            self._server.close()
+        if self._dir:
+            shutil.rmtree(self._dir, ignore_errors=True)
+            self._dir = None
 
 
-def make_tcp_listener(host: str, port: int) -> socket.socket:
-    infos = socket.getaddrinfo(host or None, port, type=socket.SOCK_STREAM,
-                               flags=socket.AI_PASSIVE)
-    if not infos:
-        raise StartupError(f"cannot resolve {host!r}")
-    fam, typ, proto, _, sa = infos[0]
-    s = socket.socket(fam, typ, proto)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+def remote_from_preamble(line: bytes) -> bytes | None:
+    """The peer's tunnel key from the helper's first line on a forwarded
+    stream: {"tunnel": {"remote": "..."}}."""
     try:
-        s.bind(sa)
-    except OSError as e:
-        s.close()
-        raise StartupError(f"cannot listen on tcp:{fmt_host(host)}:{port}: {e}") from None
-    s.listen(128)
-    s.setblocking(False)
-    return s
-
-
-def prepare_unix_path(path: str) -> None:
-    try:
-        st = os.lstat(path)
-    except FileNotFoundError:
-        d = os.path.dirname(path)
-        if d:
-            os.makedirs(d, exist_ok=True)
-        return
-    if not stat.S_ISSOCK(st.st_mode):
-        raise StartupError(f"{path} exists and is not a socket")
-    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        probe.connect(path)
-    except OSError:
-        os.unlink(path)                 # stale socket from a dead process
-        return
-    finally:
-        probe.close()
-    raise StartupError(f"{path}: another process is already listening there")
-
-
-# ---------------------------------------------------------------- connection
-
+        obj = json.loads(line)
+        return b64decode_any(obj["tunnel"]["remote"])
+    except (ValueError, KeyError, TypeError):
+        return None

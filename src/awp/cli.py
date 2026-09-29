@@ -2,8 +2,10 @@
 
 ::
 
-    python -m awp --state DIR [--name NAME] listen tcp:127.0.0.1:7000
-    python -m awp --state DIR [--name NAME] connect tc...
+    python -m awp --state DIR [--name NAME] listen tailcat        (or udp:HOST:PORT, ws:HOST:PORT, cloudflare, unix:/path)
+    python -m awp --state DIR [--name NAME] connect awp1...
+
+The tunnel is `awp tunnel` (--awp, $AWP_BIN, or awp on PATH).
 
 One JSON command per line on stdin, one JSON event per line on stdout:
 
@@ -166,7 +168,7 @@ def start_stdin_thread(loop: asyncio.AbstractEventLoop, driver: Driver) -> None:
 async def amain(args: argparse.Namespace) -> int:
     try:
         peer = Peer(args.state, name=args.name, about=args.about, trust=args.trust or (),
-                    ping_interval=args.ping_interval, blob_limit=args.max_blob)
+                    ping_interval=args.ping_interval, blob_limit=args.max_blob, awp=args.awp)
     except AwpError as e:
         emit({"event": "error", "detail": str(e)})
         return 1
@@ -210,11 +212,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="largest blob accepted, in bytes (default 50 MiB)")
     ap.add_argument("--trust", action="append", default=[], help="trust grants issued by this key (repeatable)")
     ap.add_argument("--about", default=None, help="free text for hello.about")
+    ap.add_argument("--awp", default=None, help="the awp binary, whose `awp tunnel` carries the connections")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging on stderr")
     sub = ap.add_subparsers(dest="mode", required=True, metavar="{listen,connect}")
-    for mode in ("listen", "connect"):
-        sp = sub.add_parser(mode, help=f"{mode} on ADDR (tcp:HOST:PORT, unix:/path, or tailcat)")
-        sp.add_argument("addr")
+    sp = sub.add_parser("listen", help="listen on a carrier: tailcat, udp:HOST:PORT, ws:HOST:PORT, cloudflare or unix:/path")
+    sp.add_argument("addr", metavar="carrier")
+    sp = sub.add_parser("connect", help="connect to an address (awp1...)")
+    sp.add_argument("addr", metavar="address")
     args = ap.parse_args(argv)
     logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s [awp] %(message)s", datefmt="%H:%M:%S")
