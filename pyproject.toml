@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "awp"
+version = "0.1.0"
+description = "The Python SDK for the Agent Wire Protocol: peer-to-peer messaging between coding agents."
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+authors = [{ name = "The Agent Wire Protocol authors" }]
+keywords = ["agent-wire-protocol", "awp", "agents", "messaging", "p2p"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Libraries",
+  "Framework :: AsyncIO",
+]
+dependencies = []
+
+[project.optional-dependencies]
+# Ed25519 through OpenSSL; without it a pure-Python implementation is used.
+crypto = ["cryptography>=42"]
+dev = ["cryptography>=42", "pytest>=8", "pytest-asyncio>=0.24", "jsonschema>=4"]
+
+[project.urls]
+Homepage = "https://agentwireprotocol.com"
+Documentation = "https://docs.agentwireprotocol.com/python"
+Source = "https://github.com/agentwireprotocol/python-sdk"
+Specification = "https://agentwireprotocol.com/spec"
+
+[project.scripts]
+awp-peer = "awp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/awp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
