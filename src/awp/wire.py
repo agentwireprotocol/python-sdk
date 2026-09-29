@@ -317,12 +317,23 @@ def verify_grant(g):
     return True, "ok"
 
 
-def mint_grant(identity: "Identity", sub: str, caps, ttl: float) -> dict:
+def mint_grant(identity: "Identity", sub: str, caps, ttl: float, aud: str | None = None) -> dict:
+    """A grant from identity to sub for caps, valid ttl seconds. aud binds
+    it to the one peer meant to honor it (an introduction's grant)."""
     g = {"iss": identity.key, "sub": sub, "caps": list(caps),
          "exp": fmt_ts(math.ceil(time.time() + ttl), millis=False),
          "nonce": b64url(os.urandom(32))}
+    if aud:
+        g["aud"] = aud
     g["sig"] = b64url(identity.sign(canonical_json(g)))
     return g
+
+
+def grant_hash(g: dict) -> str:
+    """How a grant is named: the SHA-256 of its canonical form, signature
+    included, shortened; the same as the reference implementation's."""
+    import hashlib
+    return hashlib.sha256(canonical_json(g)).hexdigest()[:32]
 
 
 # ---------------------------------------------------------------- persistence

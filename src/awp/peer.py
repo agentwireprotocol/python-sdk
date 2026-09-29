@@ -27,7 +27,7 @@ from .transport import (TailcatListener, fmt_host, is_loopback, make_tcp_listene
 from .wire import (ACKED_TYPES, BACKOFF_CAP, BACKOFF_INITIAL, CHUNK_SIZE, DEFAULT_BLOB_LIMIT,
                    DEFAULT_GRANT_TTL, DEFAULT_PING_INTERVAL, FSYNC, MAX_LINE, MY_CAPS,
                    PROTOCOL_VERSION, REQUEST_MIMES, CommandError, StartupError, UlidGen,
-                   b64std, b64url, blob_refs, dumps_line, format_key, key_fp, key_matches,
+                   b64std, b64url, blob_refs, dumps_line, format_key, grant_hash, key_fp, key_matches,
                    mint_grant, now_ts, parse_key, safe_name, verify_grant)
 
 
@@ -759,6 +759,9 @@ class Peer:
         ok, _ = verify_grant(g)
         if not ok:
             return False
+        aud = g.get("aud")
+        if isinstance(aud, str) and not key_matches(aud, self.identity.pub):
+            return False                    # meant for another peer to honor
         iss = parse_key(g["iss"])
         if self.is_root(iss):
             return True
@@ -919,6 +922,51 @@ class Peer:
     def caps(self, to: str) -> set[str]:
         """The capabilities the peer holds on this Peer, from honored grants."""
         return self.honored_caps(self._ps(to))
+
+    def grants(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """The grants this Peer issued and the ones it holds, valid now,
+        each with a "hash" naming it for revoke()."""
+        with_hash = lambda gs: [dict(g, hash=grant_hash(g)) for g in gs]
+        return with_hash(self.issued.valid()), with_hash(self.held.valid())
+
+    def revoke(self, hash: str) -> bool:
+        """Stop honoring a grant this Peer issued, named by its hash. The
+        peer's copy stays valid elsewhere until it expires."""
+        for g in self.issued.items:
+            if grant_hash(g) == hash:
+                self.issued.remove(g.get("sig"))
+                for ps in self.peers.values():
+                    ps.grants.remove(g.get("sig"))
+                return True
+        return False
+
+    def introduce(self, to: str, peer: str, caps: Iterable[str] = (), ttl: float = DEFAULT_GRANT_TTL,
+                  thread: str | None = None) -> Sent:
+        """Hand ``to`` the key and address of ``peer``, with a grant for
+        ``caps`` that ``peer`` honors if it trusts this Peer with introduce.
+        The grant is bound to ``peer`` (aud), so it confers nothing on anyone
+        else. The address is the one ``peer`` announced or was dialed at."""
+        if to == peer:
+            raise CommandError("cannot introduce a peer to itself")
+        target = self._ps(to)
+        known = self.peers.get(key_fp(parse_key(peer)))
+        if known is None or known.key_raw is None:
+            raise CommandError(f"unknown peer {peer}")
+        address = known.meta.get("addr") or known.meta.get("dialed")
+        if not address:
+            raise CommandError(f"no known address for {peer}")
+        g = mint_grant(self.identity, to, list(caps), ttl, aud=peer)
+        self.issued.add(g)
+        intro = {"key": known.key_str or format_key(known.key_raw), "address": address}
+        if known.meta.get("name"):
+            intro["name"] = known.meta["name"]
+        obj = self.envelope("introduce", th=thread, peer=intro, grant=g)
+        target.sendonce.add(obj)
+        conn = self.connections.get(target.fp)
+        if conn is not None:
+            conn.queue_once(obj["id"])
+        self._new_work(target)
+        return Sent(id=obj["id"], thread=thread or "", to=target.key_str or to)
 
     async def bye(self, to: str, reason: str = "done") -> None:
         """Close the connection to the peer gracefully and park it: no

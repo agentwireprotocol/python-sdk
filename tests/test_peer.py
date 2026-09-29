@@ -184,3 +184,35 @@ async def test_conformance_peer_dialing(tmp):
     failed = [r for r in rep["results"] if r["status"] == "fail"]
     assert not failed, json.dumps(failed, indent=1)
     assert rep["passed"] >= 10
+
+
+async def test_revoke_and_introduce(tmp):
+    """a revokes a grant it issued; a introduces c to b with a grant bound to c."""
+    async with awp.Peer(os.path.join(tmp, "a"), name="a@test", ping_interval=2) as a, \
+            awp.Peer(os.path.join(tmp, "b"), name="b@test", ping_interval=2) as b, \
+            awp.Peer(os.path.join(tmp, "c"), name="c@test", ping_interval=2, trust=[]) as c:
+        b_addr = await b.listen("unix:" + os.path.join(tmp, "b.sock"))
+        c_addr = await c.listen("unix:" + os.path.join(tmp, "c.sock"))
+        await a.connect(b_addr, timeout=10)
+        await a.connect(c_addr, timeout=10)
+        await next_of(b, awp.Connected)
+        await next_of(c, awp.Connected)
+
+        g = a.grant(b.key, ["fs:read"], 3600)
+        await next_of(b, awp.GrantReceived)
+        issued, _ = a.grants()
+        assert [x["sig"] for x in issued] == [g["sig"]] and "hash" in issued[0]
+        assert a.caps(b.key) == {"fs:read"}
+        assert a.revoke(issued[0]["hash"]) and not a.revoke(issued[0]["hash"])
+        assert a.caps(b.key) == set() and a.grants()[0] == []
+
+        sent = a.introduce(b.key, c.key, ["fs:read"], 3600)
+        assert sent.to == b.key
+        intro = await next_of(b, awp.Introduced)
+        assert (intro.peer, intro.key, intro.address) == (a.key, c.key, c_addr)
+        assert intro.grant and intro.grant["aud"] == c.key and intro.grant["sub"] == b.key
+        # The grant is bound to c: a itself does not honor it for b.
+        assert a.caps(b.key) == set()
+        # b meets c through the address it was handed.
+        assert await b.connect(intro.address, timeout=10) == c.key
+        await next_of(c, awp.Connected)

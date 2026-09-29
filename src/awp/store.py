@@ -423,6 +423,14 @@ class GrantList:
         self.prune()
         return list(self.items)
 
+    def remove(self, sig) -> bool:
+        keep = [g for g in self.items if g.get("sig") != sig]
+        if len(keep) == len(self.items):
+            return False
+        self.items = keep
+        self.save()
+        return True
+
     def save(self) -> None:
         atomic_write_json(self.path, self.items)
 
@@ -461,7 +469,7 @@ class PeerState:
         self.key_str = key_str
         self.meta.update({"key": format_key(self.key_raw), "key_as_sent": key_str})
         if isinstance(hello, dict):
-            for k in ("name", "about", "caps"):
+            for k in ("name", "about", "caps", "addr"):
                 if k in hello:
                     self.meta[k] = hello[k]
             self.meta["last_connected"] = now_ts()
